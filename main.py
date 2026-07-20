@@ -224,6 +224,8 @@ def generate_and_read(text, output_path, ref_audio_path, prompt_wav_path,
     seed = request.seed
     max_retries = 3 if request.retry_badcase else 1
 
+    text_len = len(re.sub(r'^\([^)]*\)', '', text))
+
     for attempt in range(max_retries):
         current_seed = seed + attempt if seed is not None else None
         attempt_path = output_path if attempt == 0 else output_path.replace(".wav", f"_retry{attempt}.wav")
@@ -240,7 +242,7 @@ def generate_and_read(text, output_path, ref_audio_path, prompt_wav_path,
             seed=current_seed,
         )
 
-        if request.retry_badcase and detect_badcase(attempt_path, len(text)):
+        if request.retry_badcase and detect_badcase(attempt_path, text_len):
             logging.warning(f"检测到异常音频，正在重试（第 {attempt+1} 次）")
             if attempt < max_retries - 1:
                 os.remove(attempt_path)
