@@ -22,28 +22,42 @@ def replace_corner_mark(text):
 def remove_bracket(text):
     text = text.replace("（", " ").replace("）", " ")
     text = text.replace("【", " ").replace("】", " ")
-    text = text.replace("`", "").replace("`", "")
+    text = text.replace("`", "")
     text = text.replace("——", " ")
     return text
 
 
+def _number_to_words(n: int, inflect_parser) -> str:
+    return inflect_parser.number_to_words(n)
+
 def spell_out_number(text, inflect_parser):
-    new_text = []
-    st = None
+    # Pre-process: handle decimal numbers (e.g. 3.14 -> three point one four)
+    decimals = re.findall(r'\d+\.\d+', text)
+    for match in decimals:
+        whole, frac = match.split('.')
+        whole_word = inflect_parser.number_to_words(int(whole))
+        frac_words = []
+        for d in frac:
+            frac_words.append(inflect_parser.number_to_words(int(d)))
+        replacement = f"{whole_word} point {' '.join(frac_words)}"
+        text = text.replace(match, replacement, 1)
+
+    digit_span = False
+    start = None
+    result = []
     for i, c in enumerate(text):
-        if not c.isdigit():
-            if st is not None:
-                num_str = inflect_parser.number_to_words(text[st:i])
-                new_text.append(num_str)
-                st = None
-            new_text.append(c)
+        if c.isdigit():
+            if not digit_span:
+                digit_span = True
+                start = i
         else:
-            if st is None:
-                st = i
-    if st is not None and st < len(text):
-        num_str = inflect_parser.number_to_words(text[st:])
-        new_text.append(num_str)
-    return "".join(new_text)
+            if digit_span:
+                result.append(inflect_parser.number_to_words(int(text[start:i])))
+                digit_span = False
+            result.append(c)
+    if digit_span:
+        result.append(inflect_parser.number_to_words(int(text[start:])))
+    return "".join(result)
 
 
 def replace_blank(text):

@@ -16,6 +16,7 @@ import uvicorn
 import requests
 import tomllib
 import threading
+import copy
 import numpy as np
 import soundfile as sf
 import librosa
@@ -23,6 +24,9 @@ import librosa
 from text_normalizer import TextNormalizer
 
 _http_session = requests.Session()
+_adapter = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=20)
+_http_session.mount("https://", _adapter)
+_http_session.mount("http://", _adapter)
 _voices_lock = threading.Lock()
 
 # ---------- 加载配置文件 ----------
@@ -92,13 +96,30 @@ def save_voices_db(db):
     with open(VOICES_DB_PATH, "w") as f:
         json.dump(db, f, indent=2)
 
+def get_voices_db_snapshot():
+    with _voices_lock:
+        return copy.copy(voices_db)
+
 voices_db = load_voices_db()
 
 # ---------- TextNormalizer ----------
 normalizer = TextNormalizer()
 
 # ---------- FastAPI ----------
-app = FastAPI(title="VoxCPM TTS Server", version="2.0")
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    cleanup_old_temp_files(0)
+    task = asyncio.create_task(periodic_temp_cleanup())
+    yield
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+app = FastAPI(title="VoxCPM TTS Server", version="2.0", lifespan=lifespan)
 
 # ---------- 请求模型 ----------
 class SpeechRequest(BaseModel):
@@ -242,9 +263,11 @@ def generate_and_read(text, output_path, ref_audio_path, prompt_wav_path,
     seed = request.seed
     max_retries = 3 if request.retry_badcase else 1
 
+    generated = []
     for attempt in range(max_retries):
         current_seed = seed + attempt if seed is not None else None
         attempt_path = output_path if attempt == 0 else output_path.replace(".wav", f"_retry{attempt}.wav")
+        generated.append(attempt_path)
 
         run_voxcpm_cli(
             text=text,
@@ -268,6 +291,9 @@ def generate_and_read(text, output_path, ref_audio_path, prompt_wav_path,
             os.rename(attempt_path, output_path)
         break
     else:
+        for p in generated:
+            if os.path.exists(p):
+                os.remove(p)
         raise RuntimeError(f"重试 {max_retries} 次后音频仍异常")
 
     try:
@@ -290,6 +316,8 @@ async def upload_voice(
 ):
     if not name:
         raise HTTPException(status_code=400, detail="Name is required")
+    if not re.match(r'^[a-zA-Z0-9_\-\.]+$', name):
+        raise HTTPException(status_code=400, detail="Name contains invalid characters (only letters, digits, _, -, . allowed)")
     if name in voices_db:
         logging.warning(f"覆盖已有语音：{name}")
 
@@ -307,11 +335,13 @@ async def upload_voice(
             "consent": consent,
             "created_at": datetime.now().isoformat(),
         }
-    await asyncio.to_thread(save_voices_db, voices_db)
+        snapshot = copy.copy(voices_db)
+    await asyncio.to_thread(save_voices_db, snapshot)
     return {"status": "success", "voice": name}
 
 @app.get("/v1/audio/voices")
 async def list_voices():
+    snapshot = get_voices_db_snapshot()
     return {
         "voices": [
             {
@@ -320,7 +350,7 @@ async def list_voices():
                 "consent": info.get("consent", ""),
                 "created_at": info.get("created_at", ""),
             }
-            for name, info in voices_db.items()
+            for name, info in snapshot.items()
         ]
     }
 
@@ -333,7 +363,8 @@ async def delete_voice(name: str):
         if audio_path and os.path.exists(audio_path):
             os.remove(audio_path)
         del voices_db[name]
-    await asyncio.to_thread(save_voices_db, voices_db)
+        snapshot = copy.copy(voices_db)
+    await asyncio.to_thread(save_voices_db, snapshot)
     return {"status": "success"}
 
 def _resolve_mode(request: SpeechRequest):
@@ -348,9 +379,9 @@ def _resolve_mode(request: SpeechRequest):
 
     # 1. Registered Voice
     if request.voice:
-        if request.voice not in voices_db:
+        entry = get_voices_db_snapshot().get(request.voice)
+        if entry is None:
             raise HTTPException(status_code=400, detail=f"语音 '{request.voice}' 不存在")
-        entry = voices_db[request.voice]
         ref_audio_path = entry["audio_path"]
         if entry.get("ref_text"):
             prompt_text = entry["ref_text"]
@@ -396,6 +427,8 @@ def _resolve_mode(request: SpeechRequest):
 async def speech(request: SpeechRequest):
     if not request.input or not request.input.strip():
         raise HTTPException(status_code=400, detail="输入文本为空")
+    if len(request.input) > 10000:
+        raise HTTPException(status_code=400, detail="输入文本超过最大长度限制（10000 字符）")
 
     if request.stream:
         raise HTTPException(status_code=400, detail="流式请求请使用 POST /v1/audio/speech/stream")
@@ -406,7 +439,7 @@ async def speech(request: SpeechRequest):
     if ref_audio_path and is_temp_download(ref_audio_path):
         downloaded_refs.append(ref_audio_path)
 
-    if ref_audio_path:
+    if ref_audio_path and not request.voice:
         await asyncio.to_thread(validate_reference_audio, ref_audio_path)
 
     # ---------- 文本归一化 ----------
@@ -418,7 +451,7 @@ async def speech(request: SpeechRequest):
     segments = split_text(text)
 
     if voice_desc:
-        segments = [f"({voice_desc}){seg}" for seg in segments]
+        segments[0] = f"({voice_desc}){segments[0]}"
 
     uid = str(uuid.uuid4())[:8]
     sr = None
@@ -461,7 +494,8 @@ async def speech(request: SpeechRequest):
 
         buf = io.BytesIO()
         sf.write(buf, full_wav, sr, format="WAV")
-        return Response(content=buf.getvalue(), media_type="audio/wav")
+        data = buf.getvalue()
+        return Response(content=data, media_type="audio/wav", headers={"Content-Length": str(len(data))})
     finally:
         for f in downloaded_refs:
             if os.path.exists(f):
@@ -472,6 +506,8 @@ async def speech(request: SpeechRequest):
 async def speech_stream(request: SpeechRequest):
     if not request.input or not request.input.strip():
         raise HTTPException(status_code=400, detail="输入文本为空")
+    if len(request.input) > 10000:
+        raise HTTPException(status_code=400, detail="输入文本超过最大长度限制（10000 字符）")
 
     ref_audio_path, prompt_wav_path, prompt_text, voice_desc = await asyncio.to_thread(_resolve_mode, request)
 
@@ -479,11 +515,11 @@ async def speech_stream(request: SpeechRequest):
     if ref_audio_path and is_temp_download(ref_audio_path):
         downloaded_refs.append(ref_audio_path)
 
-    if ref_audio_path:
+    if ref_audio_path and not request.voice:
         await asyncio.to_thread(validate_reference_audio, ref_audio_path)
 
     if request.retry_badcase:
-        logging.info("流式模式不支持 retry_badcase，已忽略")
+        raise HTTPException(status_code=400, detail="流式模式不支持 retry_badcase")
 
     text = request.input
     if request.normalize:
@@ -543,6 +579,22 @@ async def speech_stream(request: SpeechRequest):
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+# ---------- 清理临时文件 ----------
+def cleanup_old_temp_files(max_age_seconds: int = 3600):
+    now = datetime.now().timestamp()
+    for f in Path(TEMP_DIR).iterdir():
+        if f.is_file() and f.suffix in (".wav", ".mp3", ".flac"):
+            try:
+                if now - f.stat().st_mtime > max_age_seconds:
+                    f.unlink()
+            except OSError:
+                pass
+
+async def periodic_temp_cleanup():
+    while True:
+        await asyncio.sleep(3600)
+        await asyncio.to_thread(cleanup_old_temp_files, 3600)
 
 # ---------- 启动 ----------
 if __name__ == "__main__":
