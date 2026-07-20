@@ -329,6 +329,8 @@ def _resolve_mode(request: SpeechRequest):
             prompt_text = entry["ref_text"]
             prompt_wav_path = ref_audio_path
             voice_desc = request.instructions
+            if voice_desc:
+                prompt_text = None
         else:
             voice_desc = request.instructions
 
@@ -338,6 +340,8 @@ def _resolve_mode(request: SpeechRequest):
         prompt_wav_path = ref_audio_path
         prompt_text = request.ref_text
         voice_desc = request.instructions
+        if voice_desc:
+            prompt_text = None
 
     # 3. Controllable Clone + style
     elif request.ref_audio and request.instructions:
