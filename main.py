@@ -328,7 +328,7 @@ def _resolve_mode(request: SpeechRequest):
         if entry.get("ref_text"):
             prompt_text = entry["ref_text"]
             prompt_wav_path = ref_audio_path
-            # Hi-Fi 模式：instructions 被忽略（与官方文档一致）
+            voice_desc = request.instructions
         else:
             voice_desc = request.instructions
 
@@ -337,6 +337,7 @@ def _resolve_mode(request: SpeechRequest):
         ref_audio_path = resolve_audio_path(request.ref_audio)
         prompt_wav_path = ref_audio_path
         prompt_text = request.ref_text
+        voice_desc = request.instructions
 
     # 3. Controllable Clone + style
     elif request.ref_audio and request.instructions:
